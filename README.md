@@ -1,0 +1,1 @@
+# go-slim-event-bus
