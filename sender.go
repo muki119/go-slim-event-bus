@@ -1,4 +1,4 @@
-package v1
+package seb
 
 import "github.com/redis/go-redis/v9"
 
