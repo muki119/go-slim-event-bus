@@ -47,6 +47,16 @@ This is to ensure the program is non-blocking
 err := <-eventBus.Listen() 
 ```
 
+## To send a message
+Simply state the stream name and a map containing the message data.
+``` Go
+message := map[string]interface{}{
+    "user_id":   "1a2b3c",
+    "user_name": "John Doe",
+}
+eventBus.Send("user.created", message) 
+```
+
 ## To close the instance. 
 Waits for all messages acquired before closure to be processed or timeout, then closes the listener and connection.
 ``` Go
