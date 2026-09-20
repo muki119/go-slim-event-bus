@@ -10,7 +10,7 @@ import (
 )
 
 // performs the actual handling of the event creates and manages the timeout context.
-func (eventBus *StreamsEventBus) handleFunc(f Handler, data any) error {
+func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data any) error {
 	timeoutCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
 	errChan := make(chan error) // error channel
 	defer cancel()
@@ -36,14 +36,18 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 		}
 		go func() {
 			defer eventBus.maxConcurrentSem.Release(1)
-			err := eventBus.handleFunc(eventBus.streamTable[stream], message.Values) // creates another go routine
-			if err != nil {                                                          // if there's an error processing
-				slog.Error(err.Error())
+			err := eventBus.executeHandlerFunction(eventBus.streamTable[stream], message.Values) // creates another go routine
+			if err != nil {                                                                      // if there's an error processing
+				if eventBus.errorHandler != nil {
+					eventBus.errorHandler(err, &message)
+				}
 				return
 			}
-			_, err = eventBus.Connection.XAck(eventBus.ctx, stream, eventBus.ConsumerGroup, message.ID).Result()
+			_, err = eventBus.AckConnection.XAck(eventBus.ctx, stream, eventBus.ConsumerGroup, message.ID).Result()
 			if err != nil {
-				slog.Error("Error while acknowledging event", err)
+				if eventBus.errorHandler != nil {
+					eventBus.errorHandler(err, &message)
+				}
 			}
 		}() // processes message according to stream it comes from.
 	}
@@ -52,7 +56,7 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 // performs "House Cleaning" such as removal of pending before officially starting and listening for new streams messages
 func (eventBus *StreamsEventBus) processPendingMessages() error {
 	for stream := range eventBus.streamTable {
-		messages, _, err := eventBus.Connection.XAutoClaim(eventBus.ctx, &redis.XAutoClaimArgs{ // claims about 100 claims from any
+		messages, _, err := eventBus.ListenerConnection.XAutoClaim(eventBus.ctx, &redis.XAutoClaimArgs{ // claims about 100 claims from any
 			Stream:   stream,
 			Count:    eventBus.MaxCount,
 			MinIdle:  0,
@@ -73,6 +77,8 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 //
 // O(n*m) operation where n is the amount of streams and m is the maximum amount of messages in each stream.
 func (eventBus *StreamsEventBus) listen() {
+
+	
 	StreamsArr := make([]string, len(eventBus.streamTable)*2)
 	for stream := range eventBus.streamTable {
 		StreamsArr = append(StreamsArr, stream, ">")
@@ -80,7 +86,7 @@ func (eventBus *StreamsEventBus) listen() {
 
 	eventBus.Listening.Store(true)
 	for eventBus.Listening.Load() { // while listening
-		incomingStreams, err := eventBus.Connection.XReadGroup(eventBus.ctx, // Listen for incoming streams
+		incomingStreams, err := eventBus.ListenerConnection.XReadGroup(eventBus.ctx, // Listen for incoming streams
 			&redis.XReadGroupArgs{
 				Streams:  StreamsArr,
 				Group:    eventBus.ConsumerGroup,
@@ -97,7 +103,9 @@ func (eventBus *StreamsEventBus) listen() {
 		for _, stream := range incomingStreams { //for every stream in the stream batch
 			messageOperation := eventBus.streamTable[stream.Stream]
 			if messageOperation == nil { // if there is no operation for the stream
-				slog.Error(fmt.Sprintf("Stream Opperation for %s doesn't exist", stream.Stream))
+				if eventBus.errorHandler != nil {
+					eventBus.errorHandler(fmt.Errorf("Stream Operation for %s doesn't exist", stream.Stream), nil)
+				}
 				continue
 			}
 			eventBus.processMessages(stream.Stream, stream.Messages) // blocking
@@ -107,15 +115,33 @@ func (eventBus *StreamsEventBus) listen() {
 
 }
 
+// Initialize Joins all streams and consumer groups , and removes some pending messages in all streams associated under the consumer group
+func (eventBus *StreamsEventBus) initialize() error {
+	for stream := range eventBus.streamTable { // create all the groups for all the streams
+		_, err := eventBus.ListenerConnection.XGroupCreateMkStream(eventBus.ctx, stream, eventBus.ConsumerGroup, "$").Result()
+		if err != nil && err.Error() != "BUSYGROUP" {
+			return err
+		}
+	}
+	err := eventBus.processPendingMessages()
+	if err != nil {
+		if eventBus.errorHandler != nil {
+			eventBus.errorHandler(err, nil)
+		}
+		return err
+	}
+	return nil
+}
+
 func (eventBus *StreamsEventBus) Listen() chan error {
 	eventBus.waitGroup.Add(1) // wait group for graceful close
 	errChan := make(chan error)
 	go func() {
 		defer func() {
-			eventBus.waitGroup.Done()
+			eventBus.waitGroup.Done() // close once the event bus is done listening
 			close(errChan)
 		}()
-		if err := eventBus.initialize(); err != nil {
+		if err := eventBus.initialize(); err != nil { // first process any messages that are left out
 			errChan <- err
 			return
 		}

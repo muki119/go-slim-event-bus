@@ -3,7 +3,7 @@ package seb
 import "github.com/redis/go-redis/v9"
 
 func (eventBus *StreamsEventBus) Send(stream string, message map[string]interface{}) error {
-	_, err := eventBus.Connection.XAdd(eventBus.ctx, &redis.XAddArgs{
+	_, err := eventBus.SenderConnection.XAdd(eventBus.ctx, &redis.XAddArgs{
 		Stream: stream,
 		Values: message,
 		ID:     "*",

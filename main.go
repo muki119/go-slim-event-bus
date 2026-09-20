@@ -2,7 +2,7 @@ package seb
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,15 +14,19 @@ import (
 
 // Handler is a function that handles messages from a stream.
 type Handler func(context.Context, any) error
+type ErrorHandler func(error, any)
 
 // StreamsEventBus Heavily Opinionated Redis Stream Manager , meant to act as a layer of abstraction from the redis stream
 // hopefully allowing for easier management of the stream
 type StreamsEventBus struct {
-	Connection    *redis.Client // Redis client connection
-	ConsumerGroup string        // The name of the consumer group to be attached to for each stream
-	ConsumerName  string        // Name of the consumer within the consumer group
-	streamTable   map[string]Handler
-	Listening     atomic.Bool // Indicates whether the event bus is currently listening for events.
+	ListenerConnection *redis.Client // Redis client connection -- is only one connection
+	SenderConnection   *redis.Client // A pooled connection to allow concurrent message
+	AckConnection       *redis.Client // A separate connection for acknowledging messages - because the listener connection is blocking and shouldnt be used for acknowledgments.
+	ConsumerGroup      string        // The name of the consumer group to be attached to for each stream
+	ConsumerName       string        // Name of the consumer within the consumer group
+	streamTable        map[string]Handler
+	errorHandler       ErrorHandler
+	Listening          atomic.Bool // Indicates whether the event bus is currently listening for events.
 
 	MaxCount  int64           // Maximum Messages per Stream within a Read
 	Timeout   time.Duration   // Timeout stores the maximum duration a message can be processed before timing out.
@@ -30,32 +34,45 @@ type StreamsEventBus struct {
 	ctx       context.Context // Context for the event bus
 
 	maxConcurrentSem *semaphore.Weighted // Semaphore for limiting the max goroutines that can be spawned for processing tasks.
+	maxConcurrent    int64
 }
 type EventBusConfig struct {
-	Connection    *redis.Client // Redis client connection
-	ConsumerName  string        // Name of the consumer within the consumer group
-	ConsumerGroup string        // The name of the consumer group to be attached to for each stream
-	MaxCount      int64         // Maximum Messages per Stream within a Read
-	Timeout       time.Duration // Timeout stores the maximum duration a message can be processed before timing out.
-	MaxConcurrent int64         // The max goroutines that can be spawned for processing tasks.
+	ConnectionConfig *redis.Options // Redis client connection configuration
+	ConsumerName     string         // Name of the consumer within the consumer group
+	ConsumerGroup    string         // The name of the consumer group to be attached to for each stream
+	MaxCount         int64          // Maximum Messages per Stream within a Read
+	Timeout          time.Duration  // Timeout stores the maximum duration a message can be processed before timing out.
+	MaxConcurrent    int64          // The max goroutines that can be spawned for processing tasks.
 }
 
 func (config *EventBusConfig) NewFromConfig() *StreamsEventBus {
-	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.Connection, config.MaxCount, config.Timeout, config.MaxConcurrent)
+	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.ConnectionConfig, config.MaxCount, config.Timeout, config.MaxConcurrent)
 }
 
 // NewStreamsEventBus The consumer group will be the same for all streams.
-func NewStreamsEventBus(consumerName string, consumerGroup string, conn *redis.Client, maxCount int64, timeout time.Duration, maxConcurrent int64) *StreamsEventBus {
+func NewStreamsEventBus(consumerName string, consumerGroup string, options *redis.Options, maxCount int64, timeout time.Duration, maxConcurrent int64) *StreamsEventBus {
+	listenerConnectionOptions := *options  // deReferenced copy of options
+	listenerConnectionOptions.PoolSize = 1 // has to be once since we only need one listener
+	listenerConnectionOptions.MinIdleConns = 1
+
+	ackConnectionOptions := *options
+	ackConnectionOptions.PoolSize = int(maxConcurrent) // set the pool size for the acknowledgment connection to match the max concurrent processing limit
+	senderConnectionOptions := *options
+
 	newStreamEventBus := &StreamsEventBus{
-		Connection:       conn,
-		ConsumerGroup:    consumerGroup,
-		ConsumerName:     consumerName,
-		streamTable:      make(map[string]Handler),
-		MaxCount:         maxCount,
-		Timeout:          timeout,
-		waitGroup:        &sync.WaitGroup{},
-		ctx:              context.Background(),
-		maxConcurrentSem: semaphore.NewWeighted(maxConcurrent),
+		ListenerConnection: redis.NewClient(&listenerConnectionOptions),
+		AckConnection:      redis.NewClient(&ackConnectionOptions), // this is for acknowledging messages
+		SenderConnection:   redis.NewClient(&senderConnectionOptions),
+
+		ConsumerGroup:      consumerGroup,
+		ConsumerName:       consumerName,
+		streamTable:        make(map[string]Handler),
+		MaxCount:           maxCount,
+		Timeout:            timeout,
+		waitGroup:          &sync.WaitGroup{},
+		ctx:                context.Background(),
+		maxConcurrentSem:   semaphore.NewWeighted(maxConcurrent),
+		maxConcurrent:      maxConcurrent,
 	}
 	newStreamEventBus.Listening.Store(false)
 	return newStreamEventBus
@@ -66,31 +83,39 @@ func NewStreamsEventBus(consumerName string, consumerGroup string, conn *redis.C
 //
 //	All handler functions should be declared before init and listening
 func (eventBus *StreamsEventBus) StreamHandler(stream string, handlerFunc Handler) {
+	if _, exists := eventBus.streamTable[stream]; exists { // if it already exists
+		// then panic and dont allow it to run because it shouldnt be allowed
+		panic(fmt.Sprintf("%s already has a handler", stream))
+	}
 	eventBus.streamTable[stream] = handlerFunc
 }
 
-// Initialize Joins all streams and consumer groups , and removes some pending messages in all streams associated under the consumer group
-func (eventBus *StreamsEventBus) initialize() error {
-	for stream := range eventBus.streamTable { // create all the groups for all the streams
-		_, err := eventBus.Connection.XGroupCreateMkStream(eventBus.ctx, stream, eventBus.ConsumerGroup, "$").Result()
-		if err != nil && err.Error() != "BUSYGROUP" {
-			return err
-		}
-	}
-	err := eventBus.processPendingMessages()
-	if err != nil {
-		slog.Error("Error while processing pending events", err)
-		return err
-	}
-	return nil
+func (eventBus *StreamsEventBus) ErrorHandler(errorFunc ErrorHandler) {
+	eventBus.errorHandler = errorFunc
 }
 
 func (eventBus *StreamsEventBus) Close() error {
 	eventBus.Listening.Store(false)
-	eventBus.waitGroup.Wait()
-	err := eventBus.Connection.Close()
+	timedCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
+	defer cancel()
+	err := eventBus.maxConcurrentSem.Acquire(timedCtx, eventBus.MaxCount)
 	if err != nil {
 		return err
 	}
-	return nil
+	eventBus.waitGroup.Wait()
+
+	var closeErr error;
+
+	err = eventBus.ListenerConnection.Close()
+
+	if err != nil {
+		closeErr = err
+	}
+
+	err = eventBus.SenderConnection.Close()
+	if err != nil {
+		closeErr = err
+	}
+
+	return closeErr
 }
