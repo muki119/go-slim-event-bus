@@ -1,4 +1,4 @@
-package seb
+package eventbus
 
 import (
 	"context"

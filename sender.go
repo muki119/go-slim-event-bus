@@ -1,4 +1,4 @@
-package seb
+package eventbus
 
 import "github.com/redis/go-redis/v9"
 

@@ -3,22 +3,27 @@
 A strongly opinionated Redis streams abstraction mainly designed for simple inter-service communication. The purpose of this module is for it to run alongside a service's HTTP server within the same binary.
 
 ## Features 
+
 - Concurrent Message Processing.
 - Pending message housekeeping.
-    - In the instance listen, the program will process a certain number of pending messages before taking new incoming messages.
+  - In the instance listen, the program will process a certain number of pending messages before taking new incoming messages.
 - Graceful Shutdown.
 - Timeout managed handlers to prevent processes from running indefinitely .
 
-# Installation 
+# Installation
+
 In terminal , with your Go project as the current directory paste the following :
+
 ``` bash
 go get github.com/muki119/go-slim-event-bus
 ```
 
 # Usage
-## Create Event Bus instance from config.
+
+## Create Event Bus instance from config
+
 ``` Go
-ebConfig := &seb.EventBusConfig{
+ebConfig := &eventbus.EventBusConfig{
     Connection:    conn,
     ConsumerName:  "ConsumerFizz",
     ConsumerGroup: "FizzGroup",
@@ -29,26 +34,33 @@ ebConfig := &seb.EventBusConfig{
 eventBus := ebConfig.NewFromConfig()
 ```
 
-## Create Event Bus instance from the constructor.
+## Create Event Bus instance from the constructor
+
 ```Go
-eventBus := seb.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
+eventBus := eventbus.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
 ```
 
-## Register a Stream to listen to and a handler for its incoming data.
+## Register a Stream to listen to and a handler for its incoming data
+
 Registration of a stream and handler function should be made before.
+
 ```Go 
 eventBus.StreamHandler("user.created", HandleUserCreation)
 ```
 
-## To Listen 
-The listen method returns a channel that will only return errors and no other value.   
+## To Listen
+
+The listen method returns a channel that will only return errors and no other value.
 This is to ensure the program is non-blocking
+
 ``` Go
 err := <-eventBus.Listen() 
 ```
 
 ## To send a message
+
 Simply state the stream name and a map containing the message data.
+
 ``` Go
 message := map[string]interface{}{
     "user_id":   "1a2b3c",
@@ -57,14 +69,17 @@ message := map[string]interface{}{
 eventBus.Send("user.created", message) 
 ```
 
-## To close the instance. 
+## To close the instance.
+
 Waits for all messages acquired before closure to be processed or timeout, then closes the listener and connection.
+
 ``` Go
 err := eventBus.Close() 
 ```
 
 
 ## Configuration options
+
 |Field|Description|
 |-|-|
 |Connection|Pointer to the Redis connection instance.|
@@ -75,9 +90,11 @@ err := eventBus.Close()
 |MaxConcurrent|Maximum amount of messages that can be concurrently handled.|
 
 ## Examples
+
 ### From Config
+
 ``` Go
-ebConfig := &seb.EventBusConfig{
+ebConfig := &eventbus.EventBusConfig{
     Connection:    conn,
     ConsumerName:  "ConsumerFizz",
     ConsumerGroup: "FizzGroup",
@@ -112,8 +129,9 @@ if err := <-eventBus.Listen(); err != nil {
 ```
 
 ### From Constructor
+
 ```Go
-eventBus := seb.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
+eventBus := eventbus.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
 
 shutdownChan := make(chan struct{}, 1)
 go func() {
@@ -139,10 +157,10 @@ if err := <-eventBus.Listen(); err != nil {
 <-shutdownChan
 ```
 
-## Recommendations 
+## Recommendations
+
 - For handler functions , keep them aware of timeout context passed in each handler.
 
-
 ## Future Additions/Improvments
- - Dead letter queueing 
 
+- Dead letter queueing
