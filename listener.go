@@ -10,7 +10,7 @@ import (
 )
 
 // performs the actual handling of the event creates and manages the timeout context.
-func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data any) error {
+func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[string]interface{}) error {
 	timeoutCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
 	errChan := make(chan error) // error channel
 	defer cancel()
@@ -39,14 +39,14 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 			err := eventBus.executeHandlerFunction(eventBus.streamTable[stream], message.Values) // creates another go routine
 			if err != nil {                                                                      // if there's an error processing
 				if eventBus.errorHandler != nil {
-					eventBus.errorHandler(err, &message)
+					eventBus.errorHandler(err, message.Values)
 				}
 				return
 			}
 			_, err = eventBus.AckConnection.XAck(eventBus.ctx, stream, eventBus.ConsumerGroup, message.ID).Result()
 			if err != nil {
 				if eventBus.errorHandler != nil {
-					eventBus.errorHandler(err, &message)
+					eventBus.errorHandler(err, message.Values)
 				}
 			}
 		}() // processes message according to stream it comes from.
@@ -78,7 +78,6 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 // O(n*m) operation where n is the amount of streams and m is the maximum amount of messages in each stream.
 func (eventBus *StreamsEventBus) listen() {
 
-	
 	StreamsArr := make([]string, len(eventBus.streamTable)*2)
 	for stream := range eventBus.streamTable {
 		StreamsArr = append(StreamsArr, stream, ">")
