@@ -15,7 +15,7 @@ A strongly opinionated Redis streams abstraction mainly designed for simple inte
 In terminal , with your Go project as the current directory paste the following :
 
 ``` bash
-go get github.com/muki119/go-slim-event-bus
+go get github.com/muki119/go-slim-event-bus/v2
 ```
 
 # Usage

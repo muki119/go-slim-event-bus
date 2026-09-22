@@ -1,4 +1,4 @@
-module github.com/muki119/go-slim-event-bus
+module github.com/muki119/go-slim-event-bus/v2
 
 go 1.24.4
 

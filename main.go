@@ -13,15 +13,15 @@ import (
 )
 
 // Handler is a function that handles messages from a stream.
-type Handler func(context.Context, any) error
-type ErrorHandler func(error, any)
+type Handler func(context.Context, map[string]interface{}) error
+type ErrorHandler func(error, map[string]interface{})
 
 // StreamsEventBus Heavily Opinionated Redis Stream Manager , meant to act as a layer of abstraction from the redis stream
 // hopefully allowing for easier management of the stream
 type StreamsEventBus struct {
 	ListenerConnection *redis.Client // Redis client connection -- is only one connection
 	SenderConnection   *redis.Client // A pooled connection to allow concurrent message
-	AckConnection       *redis.Client // A separate connection for acknowledging messages - because the listener connection is blocking and shouldnt be used for acknowledgments.
+	AckConnection      *redis.Client // A separate connection for acknowledging messages - because the listener connection is blocking and shouldnt be used for acknowledgments.
 	ConsumerGroup      string        // The name of the consumer group to be attached to for each stream
 	ConsumerName       string        // Name of the consumer within the consumer group
 	streamTable        map[string]Handler
@@ -64,15 +64,15 @@ func NewStreamsEventBus(consumerName string, consumerGroup string, options *redi
 		AckConnection:      redis.NewClient(&ackConnectionOptions), // this is for acknowledging messages
 		SenderConnection:   redis.NewClient(&senderConnectionOptions),
 
-		ConsumerGroup:      consumerGroup,
-		ConsumerName:       consumerName,
-		streamTable:        make(map[string]Handler),
-		MaxCount:           maxCount,
-		Timeout:            timeout,
-		waitGroup:          &sync.WaitGroup{},
-		ctx:                context.Background(),
-		maxConcurrentSem:   semaphore.NewWeighted(maxConcurrent),
-		maxConcurrent:      maxConcurrent,
+		ConsumerGroup:    consumerGroup,
+		ConsumerName:     consumerName,
+		streamTable:      make(map[string]Handler),
+		MaxCount:         maxCount,
+		Timeout:          timeout,
+		waitGroup:        &sync.WaitGroup{},
+		ctx:              context.Background(),
+		maxConcurrentSem: semaphore.NewWeighted(maxConcurrent),
+		maxConcurrent:    maxConcurrent,
 	}
 	newStreamEventBus.Listening.Store(false)
 	return newStreamEventBus
@@ -104,7 +104,7 @@ func (eventBus *StreamsEventBus) Close() error {
 	}
 	eventBus.waitGroup.Wait()
 
-	var closeErr error;
+	var closeErr error
 
 	err = eventBus.ListenerConnection.Close()
 
