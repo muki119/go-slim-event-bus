@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -108,7 +109,9 @@ func (eventBus *StreamsEventBus) listen() {
 			}).Result()
 
 		if err != nil {
-			slog.Error(err.Error())
+			if !errors.Is(err, redis.Nil) && eventBus.errorHandler != nil {
+				eventBus.errorHandler(err, nil)
+			}
 			continue
 		}
 
