@@ -4,10 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+func isConsumerGroupAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errText := err.Error()
+	return errText == "BUSYGROUP" || strings.HasPrefix(errText, "BUSYGROUP ")
+}
 
 // performs the actual handling of the event creates and manages the timeout context.
 func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[string]interface{}) error {
@@ -118,7 +128,7 @@ func (eventBus *StreamsEventBus) listen() {
 func (eventBus *StreamsEventBus) initialize() error {
 	for stream := range eventBus.streamTable { // create all the groups for all the streams
 		_, err := eventBus.ListenerConnection.XGroupCreateMkStream(eventBus.ctx, stream, eventBus.ConsumerGroup, "$").Result()
-		if err != nil && err.Error() != "BUSYGROUP" {
+		if err != nil && !isConsumerGroupAlreadyExists(err) {
 			return err
 		}
 	}
