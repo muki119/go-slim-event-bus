@@ -88,9 +88,12 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 // O(n*m) operation where n is the amount of streams and m is the maximum amount of messages in each stream.
 func (eventBus *StreamsEventBus) listen() {
 
-	StreamsArr := make([]string, len(eventBus.streamTable)*2)
+	StreamsArr := make([]string, 0, len(eventBus.streamTable)*2)
 	for stream := range eventBus.streamTable {
-		StreamsArr = append(StreamsArr, stream, ">")
+		StreamsArr = append(StreamsArr, stream)
+	}
+	for range eventBus.streamTable {
+		StreamsArr = append(StreamsArr, ">")
 	}
 
 	eventBus.Listening.Store(true)
