@@ -10,6 +10,8 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Handler is a function that handles messages from a stream.
@@ -33,6 +35,8 @@ type StreamsEventBus struct {
 	waitGroup *sync.WaitGroup // wait group for Listen process - This is used for graceful closure.
 	ctx       context.Context // Context for the event bus
 
+	Tracer trace.Tracer // Tracer used to wrap each handler execution in a span. Defaults to a no-op tracer if not provided.
+
 	maxConcurrentSem *semaphore.Weighted // Semaphore for limiting the max goroutines that can be spawned for processing tasks.
 	maxConcurrent    int64
 }
@@ -43,14 +47,18 @@ type EventBusConfig struct {
 	MaxCount         int64          // Maximum Messages per Stream within a Read
 	Timeout          time.Duration  // Timeout stores the maximum duration a message can be processed before timing out.
 	MaxConcurrent    int64          // The max goroutines that can be spawned for processing tasks.
+	Tracer           trace.Tracer   // Optional. Defaults to a no-op tracer if nil.
 }
 
 func (config *EventBusConfig) NewFromConfig() *StreamsEventBus {
-	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.ConnectionConfig, config.MaxCount, config.Timeout, config.MaxConcurrent)
+	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.ConnectionConfig, config.MaxCount, config.Timeout, config.MaxConcurrent, config.Tracer)
 }
 
 // NewStreamsEventBus The consumer group will be the same for all streams.
-func NewStreamsEventBus(consumerName string, consumerGroup string, options *redis.Options, maxCount int64, timeout time.Duration, maxConcurrent int64) *StreamsEventBus {
+func NewStreamsEventBus(consumerName string, consumerGroup string, options *redis.Options, maxCount int64, timeout time.Duration, maxConcurrent int64, tracer trace.Tracer) *StreamsEventBus {
+	if tracer == nil {
+		tracer = noop.NewTracerProvider().Tracer("eventbus")
+	}
 	listenerConnectionOptions := *options  // deReferenced copy of options
 	listenerConnectionOptions.PoolSize = 1 // has to be once since we only need one listener
 	listenerConnectionOptions.MinIdleConns = 1
@@ -69,6 +77,7 @@ func NewStreamsEventBus(consumerName string, consumerGroup string, options *redi
 		streamTable:      make(map[string]Handler),
 		MaxCount:         maxCount,
 		Timeout:          timeout,
+		Tracer:           tracer,
 		waitGroup:        &sync.WaitGroup{},
 		ctx:              context.Background(),
 		maxConcurrentSem: semaphore.NewWeighted(maxConcurrent),

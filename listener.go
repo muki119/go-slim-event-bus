@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
 )
 
 func isConsumerGroupAlreadyExists(err error) bool {
@@ -20,23 +21,34 @@ func isConsumerGroupAlreadyExists(err error) bool {
 	return errText == "BUSYGROUP" || strings.HasPrefix(errText, "BUSYGROUP ")
 }
 
-// performs the actual handling of the event creates and manages the timeout context.
-func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[string]interface{}) (context.Context, error) {
+// performs the actual handling of the event, manages the timeout context, and wraps the
+// handler execution in a span so both the handler's own spans and any error passed to the
+// ErrorHandler nest under the same trace.
+func (eventBus *StreamsEventBus) executeHandlerFunction(stream string, f Handler, data map[string]interface{}) (context.Context, error) {
 	timeoutCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
-	errChan := make(chan error) // error channel
 	defer cancel()
+
+	ctx, span := eventBus.Tracer.Start(timeoutCtx, fmt.Sprintf("eventbus.handle %s", stream))
+	defer span.End()
+
+	errChan := make(chan error) // error channel
 	go func() {
-		errChan <- f(timeoutCtx, data)
+		errChan <- f(ctx, data)
 	}()
 	select {
 	case err := <-errChan: // if the function returns before the timeout
 		if err != nil {
-			return timeoutCtx, err
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return ctx, err
 		}
-	case <-timeoutCtx.Done(): // if the timeout is done before the function returns
-		return timeoutCtx, timeoutCtx.Err() // return a timeout error
+	case <-ctx.Done(): // if the timeout is done before the function returns
+		err := ctx.Err()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return ctx, err // return a timeout error
 	}
-	return timeoutCtx, nil
+	return ctx, nil
 }
 
 func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis.XMessage) { // blocking
@@ -47,7 +59,7 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 		}
 		go func() {
 			defer eventBus.maxConcurrentSem.Release(1)
-			funcCtx, err := eventBus.executeHandlerFunction(eventBus.streamTable[stream], message.Values) // creates another go routine
+			funcCtx, err := eventBus.executeHandlerFunction(stream, eventBus.streamTable[stream], message.Values) // creates another go routine
 			if err != nil {                                                                               // if there's an error processing
 				if eventBus.errorHandler != nil {
 					eventBus.errorHandler(funcCtx, err, message.Values)
@@ -76,8 +88,12 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 			Group:    eventBus.ConsumerGroup,
 		}).Result()
 		if err != nil {
-			return err
+			if !errors.Is(err, redis.Nil) && eventBus.errorHandler != nil {
+				eventBus.errorHandler(eventBus.ctx, err, nil)
+			}
+			continue
 		}
+
 		eventBus.processMessages(stream, messages)
 	}
 
