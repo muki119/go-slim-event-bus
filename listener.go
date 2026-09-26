@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 func isConsumerGroupAlreadyExists(err error) bool {
@@ -31,9 +33,20 @@ func isIdleReadTimeout(err error) bool {
 
 // performs the actual handling of the event, manages the timeout context, and wraps the
 // handler execution in a span so both the handler's own spans and any error passed to the
-// ErrorHandler nest under the same trace.
+// ErrorHandler nest under the same trace. If the message carries a traceparent/tracestate
+// (injected by Send on the publishing side), the span is a child of that remote trace instead
+// of starting a new one.
 func (eventBus *StreamsEventBus) executeHandlerFunction(stream string, f Handler, data map[string]interface{}) (context.Context, error) {
-	timeoutCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
+	carrier := make(map[string]string, 2)
+	if v, ok := data["traceparent"].(string); ok {
+		carrier["traceparent"] = v
+	}
+	if v, ok := data["tracestate"].(string); ok {
+		carrier["tracestate"] = v
+	}
+	parentCtx := otel.GetTextMapPropagator().Extract(eventBus.ctx, propagation.MapCarrier(carrier))
+
+	timeoutCtx, cancel := context.WithTimeout(parentCtx, eventBus.Timeout)
 	defer cancel()
 
 	ctx, span := eventBus.Tracer.Start(timeoutCtx, fmt.Sprintf("eventbus.handle %s", stream))

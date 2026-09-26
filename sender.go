@@ -1,9 +1,25 @@
 package eventbus
 
-import "github.com/redis/go-redis/v9"
+import (
+	"context"
 
-func (eventBus *StreamsEventBus) Send(stream string, message map[string]interface{}) error {
-	_, err := eventBus.SenderConnection.XAdd(eventBus.ctx, &redis.XAddArgs{
+	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+)
+
+// Send publishes message to stream, injecting the trace context from ctx (traceparent/tracestate)
+// as regular fields on the message - Redis Streams entries are flat, so propagation headers ride
+// along in the same map as the caller's own data, using whatever propagator is globally registered
+// via otel.SetTextMapPropagator (a no-op if the host service never set one).
+func (eventBus *StreamsEventBus) Send(ctx context.Context, stream string, message map[string]interface{}) error {
+	carrier := make(map[string]string)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(carrier))
+	for key, value := range carrier {
+		message[key] = value
+	}
+
+	_, err := eventBus.SenderConnection.XAdd(ctx, &redis.XAddArgs{
 		Stream: stream,
 		Values: message,
 		ID:     "*",
