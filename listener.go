@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -54,13 +53,13 @@ func (eventBus *StreamsEventBus) executeHandlerFunction(stream string, f Handler
 func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis.XMessage) { // blocking
 	for _, message := range messages { // iterates through consumers incoming messages
 		if err := eventBus.maxConcurrentSem.Acquire(eventBus.ctx, 1); err != nil {
-			slog.Error(err.Error())
+			eventBus.errorHandler(eventBus.ctx, fmt.Errorf("failed to acquire semaphore: %w", err), message.Values)
 			continue
 		}
 		go func() {
 			defer eventBus.maxConcurrentSem.Release(1)
 			funcCtx, err := eventBus.executeHandlerFunction(stream, eventBus.streamTable[stream], message.Values) // creates another go routine
-			if err != nil {                                                                               // if there's an error processing
+			if err != nil {                                                                                       // if there's an error processing
 				if eventBus.errorHandler != nil {
 					eventBus.errorHandler(funcCtx, err, message.Values)
 				}
@@ -79,22 +78,28 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 // performs "House Cleaning" such as removal of pending before officially starting and listening for new streams messages
 func (eventBus *StreamsEventBus) processPendingMessages() error {
 	for stream := range eventBus.streamTable {
-		messages, _, err := eventBus.ListenerConnection.XAutoClaim(eventBus.ctx, &redis.XAutoClaimArgs{ // claims about 100 claims from any
-			Stream:   stream,
-			Count:    eventBus.MaxCount,
-			MinIdle:  0,
-			Consumer: eventBus.ConsumerName,
-			Start:    "0-0",
-			Group:    eventBus.ConsumerGroup,
-		}).Result()
-		if err != nil {
-			if !errors.Is(err, redis.Nil) && eventBus.errorHandler != nil {
-				eventBus.errorHandler(eventBus.ctx, err, nil)
+		for {
+			messages, _, err := eventBus.ListenerConnection.XAutoClaim(eventBus.ctx, &redis.XAutoClaimArgs{ // claims about 100 claims from any
+				Stream:   stream,
+				Count:    eventBus.MaxCount,
+				MinIdle:  0,
+				Consumer: eventBus.ConsumerName,
+				Start:    "0-0",
+				Group:    eventBus.ConsumerGroup,
+			}).Result()
+			if err != nil {
+				if errors.Is(err, redis.Nil) { // no pending messages for this stream - not an error
+					break
+				}
+				if eventBus.errorHandler != nil {
+					eventBus.errorHandler(eventBus.ctx, err, nil)
+				}
+				continue
 			}
-			continue
-		}
 
-		eventBus.processMessages(stream, messages)
+			eventBus.processMessages(stream, messages)
+			break
+		}
 	}
 
 	return nil
@@ -125,7 +130,10 @@ func (eventBus *StreamsEventBus) listen() {
 			}).Result()
 
 		if err != nil {
-			if !errors.Is(err, redis.Nil) && eventBus.errorHandler != nil {
+			if errors.Is(err, redis.Nil) { // no new messages within the block window - not an error
+				continue
+			}
+			if eventBus.errorHandler != nil {
 				eventBus.errorHandler(eventBus.ctx, err, nil)
 			}
 			continue
