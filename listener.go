@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -18,6 +19,14 @@ func isConsumerGroupAlreadyExists(err error) bool {
 
 	errText := err.Error()
 	return errText == "BUSYGROUP" || strings.HasPrefix(errText, "BUSYGROUP ")
+}
+
+//	whether err is a network-level timeout (the client gave up waiting
+//
+// for a response within its ReadTimeout) rather than a real failure.
+func isIdleReadTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // performs the actual handling of the event, manages the timeout context, and wraps the
@@ -91,6 +100,9 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 				if errors.Is(err, redis.Nil) { // no pending messages for this stream - not an error
 					break
 				}
+				if isIdleReadTimeout(err) { // the idle read simply timed out - not an error
+					continue
+				}
 				if eventBus.errorHandler != nil {
 					eventBus.errorHandler(eventBus.ctx, err, nil)
 				}
@@ -130,7 +142,7 @@ func (eventBus *StreamsEventBus) listen() {
 			}).Result()
 
 		if err != nil {
-			if errors.Is(err, redis.Nil) { // no new messages within the block window - not an error
+			if errors.Is(err, redis.Nil) || isIdleReadTimeout(err) { // no new messages, or the idle read simply timed out - not an error
 				continue
 			}
 			if eventBus.errorHandler != nil {
