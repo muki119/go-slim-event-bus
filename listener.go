@@ -21,7 +21,7 @@ func isConsumerGroupAlreadyExists(err error) bool {
 }
 
 // performs the actual handling of the event creates and manages the timeout context.
-func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[string]interface{}) error {
+func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[string]interface{}) (context.Context, error) {
 	timeoutCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
 	errChan := make(chan error) // error channel
 	defer cancel()
@@ -31,12 +31,12 @@ func (eventBus *StreamsEventBus) executeHandlerFunction(f Handler, data map[stri
 	select {
 	case err := <-errChan: // if the function returns before the timeout
 		if err != nil {
-			return err
+			return timeoutCtx, err
 		}
 	case <-timeoutCtx.Done(): // if the timeout is done before the function returns
-		return timeoutCtx.Err() // return a timeout error
+		return timeoutCtx, timeoutCtx.Err() // return a timeout error
 	}
-	return nil
+	return timeoutCtx, nil
 }
 
 func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis.XMessage) { // blocking
@@ -47,17 +47,17 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 		}
 		go func() {
 			defer eventBus.maxConcurrentSem.Release(1)
-			err := eventBus.executeHandlerFunction(eventBus.streamTable[stream], message.Values) // creates another go routine
-			if err != nil {                                                                      // if there's an error processing
+			funcCtx, err := eventBus.executeHandlerFunction(eventBus.streamTable[stream], message.Values) // creates another go routine
+			if err != nil {                                                                               // if there's an error processing
 				if eventBus.errorHandler != nil {
-					eventBus.errorHandler(err, message.Values)
+					eventBus.errorHandler(funcCtx, err, message.Values)
 				}
 				return
 			}
 			_, err = eventBus.AckConnection.XAck(eventBus.ctx, stream, eventBus.ConsumerGroup, message.ID).Result()
 			if err != nil {
 				if eventBus.errorHandler != nil {
-					eventBus.errorHandler(err, message.Values)
+					eventBus.errorHandler(funcCtx, err, message.Values)
 				}
 			}
 		}() // processes message according to stream it comes from.
@@ -110,7 +110,7 @@ func (eventBus *StreamsEventBus) listen() {
 
 		if err != nil {
 			if !errors.Is(err, redis.Nil) && eventBus.errorHandler != nil {
-				eventBus.errorHandler(err, nil)
+				eventBus.errorHandler(eventBus.ctx, err, nil)
 			}
 			continue
 		}
@@ -119,7 +119,7 @@ func (eventBus *StreamsEventBus) listen() {
 			messageOperation := eventBus.streamTable[stream.Stream]
 			if messageOperation == nil { // if there is no operation for the stream
 				if eventBus.errorHandler != nil {
-					eventBus.errorHandler(fmt.Errorf("Stream Operation for %s doesn't exist", stream.Stream), nil)
+					eventBus.errorHandler(eventBus.ctx, fmt.Errorf("Stream Operation for %s doesn't exist", stream.Stream), nil)
 				}
 				continue
 			}
@@ -141,7 +141,7 @@ func (eventBus *StreamsEventBus) initialize() error {
 	err := eventBus.processPendingMessages()
 	if err != nil {
 		if eventBus.errorHandler != nil {
-			eventBus.errorHandler(err, nil)
+			eventBus.errorHandler(eventBus.ctx, err, nil)
 		}
 		return err
 	}

@@ -14,7 +14,7 @@ import (
 
 // Handler is a function that handles messages from a stream.
 type Handler func(context.Context, map[string]interface{}) error
-type ErrorHandler func(error, map[string]interface{})
+type ErrorHandler func(context.Context, error, map[string]interface{})
 
 // StreamsEventBus Heavily Opinionated Redis Stream Manager , meant to act as a layer of abstraction from the redis stream
 // hopefully allowing for easier management of the stream
