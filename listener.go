@@ -52,7 +52,7 @@ func (eventBus *StreamsEventBus) executeHandlerFunction(stream string, f Handler
 	ctx, span := eventBus.Tracer.Start(timeoutCtx, fmt.Sprintf("eventbus.handle %s", stream))
 	defer span.End()
 
-	errChan := make(chan error) // error channel
+	errChan := make(chan error, 1) // error channel
 	go func() {
 		errChan <- f(ctx, data)
 	}()
@@ -99,6 +99,8 @@ func (eventBus *StreamsEventBus) processMessages(stream string, messages []redis
 
 // performs "House Cleaning" such as removal of pending before officially starting and listening for new streams messages
 func (eventBus *StreamsEventBus) processPendingMessages() error {
+	var expBackoff = newExponentialBackoff(eventBus.MinDelay, eventBus.MaxDelay, eventBus.Multiplier) // create a new exponential backoff instance
+
 	for stream := range eventBus.streamTable {
 		for {
 			messages, _, err := eventBus.ListenerConnection.XAutoClaim(eventBus.ctx, &redis.XAutoClaimArgs{ // claims about 100 claims from any
@@ -119,10 +121,15 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 				if eventBus.errorHandler != nil {
 					eventBus.errorHandler(eventBus.ctx, err, nil)
 				}
+				if eventBus.MaxRetries > 0 && expBackoff.GetRetryCount() >= eventBus.MaxRetries {
+					return fmt.Errorf("giving up claiming pending messages for %s after %d retries: %w", stream, eventBus.MaxRetries, err)
+				}
+				time.Sleep(expBackoff.NextDelay())
 				continue
 			}
 
 			eventBus.processMessages(stream, messages)
+			expBackoff.Reset() // reset the backoff after a successful processing of messages
 			break
 		}
 	}
@@ -133,7 +140,7 @@ func (eventBus *StreamsEventBus) processPendingMessages() error {
 // Listens for incoming messages from stream for their associated consumer groups
 //
 // O(n*m) operation where n is the amount of streams and m is the maximum amount of messages in each stream.
-func (eventBus *StreamsEventBus) listen() {
+func (eventBus *StreamsEventBus) listen() error {
 
 	StreamsArr := make([]string, 0, len(eventBus.streamTable)*2)
 	for stream := range eventBus.streamTable {
@@ -144,7 +151,8 @@ func (eventBus *StreamsEventBus) listen() {
 	}
 
 	eventBus.Listening.Store(true)
-	for eventBus.Listening.Load() { // while listening
+	var expBackoff = newExponentialBackoff(eventBus.MinDelay, eventBus.MaxDelay, eventBus.Multiplier) // create a new exponential backoff instance
+	for eventBus.Listening.Load() {                                                                   // while listening
 		incomingStreams, err := eventBus.ListenerConnection.XReadGroup(eventBus.ctx, // Listen for incoming streams
 			&redis.XReadGroupArgs{
 				Streams:  StreamsArr,
@@ -155,14 +163,25 @@ func (eventBus *StreamsEventBus) listen() {
 			}).Result()
 
 		if err != nil {
-			if errors.Is(err, redis.Nil) || isIdleReadTimeout(err) { // no new messages, or the idle read simply timed out - not an error
+			if errors.Is(err, redis.Nil) { // no new messages
+				expBackoff.Reset()
+				continue
+			}
+			if isIdleReadTimeout(err) { // the idle read simply timed out - not an error
 				continue
 			}
 			if eventBus.errorHandler != nil {
 				eventBus.errorHandler(eventBus.ctx, err, nil)
 			}
+			if eventBus.MaxRetries > 0 && expBackoff.GetRetryCount() >= eventBus.MaxRetries {
+				eventBus.Listening.Store(false)
+				return fmt.Errorf("giving up reading from streams after %d retries: %w", eventBus.MaxRetries, err)
+			}
+			time.Sleep(expBackoff.NextDelay()) // wait for the next delay before retrying
 			continue
 		}
+
+		expBackoff.Reset() // a successful read means any earlier failures are over
 
 		for _, stream := range incomingStreams { //for every stream in the stream batch
 			messageOperation := eventBus.streamTable[stream.Stream]
@@ -176,7 +195,7 @@ func (eventBus *StreamsEventBus) listen() {
 		}
 
 	}
-
+	return nil
 }
 
 // Initialize Joins all streams and consumer groups , and removes some pending messages in all streams associated under the consumer group
@@ -198,8 +217,8 @@ func (eventBus *StreamsEventBus) initialize() error {
 }
 
 func (eventBus *StreamsEventBus) Listen() chan error {
-	eventBus.waitGroup.Add(1) // wait group for graceful close
-	errChan := make(chan error)
+	eventBus.waitGroup.Add(1)      // wait group for graceful close
+	errChan := make(chan error, 1) // buffered so the goroutine can exit (and release the wait group) even if the caller never reads the error
 	go func() {
 		defer func() {
 			eventBus.waitGroup.Done() // close once the event bus is done listening
@@ -209,7 +228,9 @@ func (eventBus *StreamsEventBus) Listen() chan error {
 			errChan <- err
 			return
 		}
-		eventBus.listen()
+		if err := eventBus.listen(); err != nil {
+			errChan <- err
+		}
 	}()
 	return errChan // returning an error channel because function needs to be concurrent
 }

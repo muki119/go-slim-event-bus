@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,12 @@ type StreamsEventBus struct {
 
 	maxConcurrentSem *semaphore.Weighted // Semaphore for limiting the max goroutines that can be spawned for processing tasks.
 	maxConcurrent    int64
+
+	MinDelay   time.Duration // Minimum delay for exponential backoff. Default is 100 milliseconds.
+	MaxDelay   time.Duration // Maximum delay for exponential backoff. Default is 10 seconds.
+	Multiplier float64       // Multiplier for the backoff. Default is 2.0.
+
+	MaxRetries int // How many times a failing Redis call is retried (with backoff) before giving up and returning an error. 0 retries forever.
 }
 type EventBusConfig struct {
 	ConnectionConfig *redis.Options // Redis client connection configuration
@@ -48,14 +55,18 @@ type EventBusConfig struct {
 	Timeout          time.Duration  // Timeout stores the maximum duration a message can be processed before timing out.
 	MaxConcurrent    int64          // The max goroutines that can be spawned for processing tasks.
 	Tracer           trace.Tracer   // Optional. Defaults to a no-op tracer if nil.
+	MinDelay         time.Duration  // Minimum delay for exponential backoff. Default is 100 milliseconds.
+	MaxDelay         time.Duration  // Maximum delay for exponential backoff. Default is 10 seconds.
+	Multiplier       float64        // Multiplier for the backoff. Default is 2.0.
+	MaxRetries       int            // How many times a failing Redis call is retried (with backoff) before giving up and returning an error. 0 retries forever.
 }
 
 func (config *EventBusConfig) NewFromConfig() *StreamsEventBus {
-	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.ConnectionConfig, config.MaxCount, config.Timeout, config.MaxConcurrent, config.Tracer)
+	return NewStreamsEventBus(config.ConsumerName, config.ConsumerGroup, config.ConnectionConfig, config.MaxCount, config.Timeout, config.MaxConcurrent, config.Tracer, config.MinDelay, config.MaxDelay, config.Multiplier, config.MaxRetries)
 }
 
 // NewStreamsEventBus The consumer group will be the same for all streams.
-func NewStreamsEventBus(consumerName string, consumerGroup string, options *redis.Options, maxCount int64, timeout time.Duration, maxConcurrent int64, tracer trace.Tracer) *StreamsEventBus {
+func NewStreamsEventBus(consumerName string, consumerGroup string, options *redis.Options, maxCount int64, timeout time.Duration, maxConcurrent int64, tracer trace.Tracer, minDelay time.Duration, maxDelay time.Duration, multiplier float64, maxRetries int) *StreamsEventBus {
 	if tracer == nil {
 		tracer = noop.NewTracerProvider().Tracer("eventbus")
 	}
@@ -82,6 +93,10 @@ func NewStreamsEventBus(consumerName string, consumerGroup string, options *redi
 		ctx:              context.Background(),
 		maxConcurrentSem: semaphore.NewWeighted(maxConcurrent),
 		maxConcurrent:    maxConcurrent,
+		MinDelay:         minDelay,
+		MaxDelay:         maxDelay,
+		Multiplier:       multiplier,
+		MaxRetries:       maxRetries,
 	}
 	newStreamEventBus.Listening.Store(false)
 	return newStreamEventBus
@@ -107,23 +122,29 @@ func (eventBus *StreamsEventBus) Close() error {
 	eventBus.Listening.Store(false)
 	timedCtx, cancel := context.WithTimeout(eventBus.ctx, eventBus.Timeout)
 	defer cancel()
-	err := eventBus.maxConcurrentSem.Acquire(timedCtx, eventBus.MaxCount)
+
+	var closeErr error
+	err := eventBus.maxConcurrentSem.Acquire(timedCtx, eventBus.maxConcurrent)
 	if err != nil {
-		return err
+		closeErr = errors.Join(closeErr, err)
 	}
 	eventBus.waitGroup.Wait()
 
-	var closeErr error
+	err = eventBus.AckConnection.Close()
+
+	if err != nil {
+		closeErr = errors.Join(closeErr, err)
+	}
 
 	err = eventBus.ListenerConnection.Close()
 
 	if err != nil {
-		closeErr = err
+		closeErr = errors.Join(closeErr, err)
 	}
 
 	err = eventBus.SenderConnection.Close()
 	if err != nil {
-		closeErr = err
+		closeErr = errors.Join(closeErr, err)
 	}
 
 	return closeErr
