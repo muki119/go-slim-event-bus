@@ -8,7 +8,9 @@ A strongly opinionated Redis streams abstraction mainly designed for simple inte
 - Pending message housekeeping.
   - In the instance listen, the program will process a certain number of pending messages before taking new incoming messages.
 - Graceful Shutdown.
-- Timeout managed handlers to prevent processes from running indefinitely .
+- Timeout-managed handlers to prevent processes from running indefinitely.
+- Exponential backoff for retrying failed Redis reads and pending-message claims.
+- OpenTelemetry tracing for message publishing and handler execution.
 
 # Installation
 
@@ -24,12 +26,17 @@ go get github.com/muki119/go-slim-event-bus/v2
 
 ``` Go
 ebConfig := &eventbus.EventBusConfig{
-    Connection:    conn,
+    ConnectionConfig: conn,
     ConsumerName:  "ConsumerFizz",
     ConsumerGroup: "FizzGroup",
     MaxCount:      100,
     Timeout:       3 * time.Second,
-    MaxConcurrent: int64(runtime.NumCPU() / 10),
+    MaxConcurrent: int64(runtime.NumCPU() * 10),
+    Tracer:        tracer,
+    MinDelay:      100 * time.Millisecond,
+    MaxDelay:      10 * time.Second,
+    Multiplier:    2.0,
+    MaxRetries:    5,
 }
 eventBus := ebConfig.NewFromConfig()
 ```
@@ -37,15 +44,46 @@ eventBus := ebConfig.NewFromConfig()
 ## Create Event Bus instance from the constructor
 
 ```Go
-eventBus := eventbus.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
+eventBus := eventbus.NewStreamsEventBus(
+    "ConsumerFizz",
+    "FizzGroup",
+    conn,
+    100,
+    3*time.Second,
+    int64(runtime.NumCPU() * 10),
+    tracer,
+    100*time.Millisecond,
+    10*time.Second,
+    2.0,
+    5,
+)
 ```
 
 ## Register a Stream to listen to and a handler for its incoming data
 
 Registration of a stream and handler function should be made before.
 
-```Go 
+```Go
+func HandleUserCreation(ctx context.Context, data map[string]interface{}) error {
+    return nil
+}
+
 eventBus.StreamHandler("user.created", HandleUserCreation)
+```
+
+Handlers receive a timeout-managed context and return an error when processing
+fails. The event bus acknowledges a message only after its handler completes
+successfully.
+
+## Handle errors
+
+Register an optional error handler to receive Redis errors, handler errors, and
+message acknowledgement errors:
+
+```Go
+eventBus.ErrorHandler(func(ctx context.Context, err error, data map[string]interface{}) {
+    log.Printf("event bus error: %v", err)
+})
 ```
 
 ## To Listen
@@ -59,15 +97,23 @@ err := <-eventBus.Listen()
 
 ## To send a message
 
-Simply state the stream name and a map containing the message data.
+State the context, stream name, and a map containing the message data.
 
 ``` Go
+ctx := context.Background()
 message := map[string]interface{}{
     "user_id":   "1a2b3c",
     "user_name": "John Doe",
 }
-eventBus.Send("user.created", message) 
+if err := eventBus.Send(ctx, "user.created", message); err != nil {
+    log.Printf("Error occurred while sending message: %v", err)
+}
 ```
+
+`Send` injects the globally configured OpenTelemetry propagation fields
+(`traceparent` and `tracestate`, when available) into the Redis stream entry.
+The listener extracts those fields and creates the handler span as a child of
+the publishing trace.
 
 ## To close the instance.
 
@@ -88,6 +134,11 @@ err := eventBus.Close()
 |MaxCount|Maximum number of messages in each stream every read.|
 |Timeout|Max amount of time for handlers to process a message.|
 |MaxConcurrent|Maximum amount of messages that can be concurrently handled.|
+|Tracer|OpenTelemetry tracer used for handler spans. Defaults to a no-op tracer when nil.|
+|MinDelay|Initial delay for Redis retries. Defaults to 100 milliseconds when zero or negative.|
+|MaxDelay|Maximum delay for Redis retries. Defaults to 10 seconds when zero or negative.|
+|Multiplier|Multiplier used by exponential retry backoff. Defaults to 2.0 when less than 1.|
+|MaxRetries|Maximum number of retries for a failing Redis read or pending-message claim. `0` retries forever.|
 
 ## Examples
 
@@ -95,18 +146,23 @@ err := eventBus.Close()
 
 ``` Go
 ebConfig := &eventbus.EventBusConfig{
-    Connection:    conn,
+    ConnectionConfig: conn,
     ConsumerName:  "ConsumerFizz",
     ConsumerGroup: "FizzGroup",
     MaxCount:      100,
     Timeout:       3 * time.Second,
-    MaxConcurrent: int64(runtime.NumCPU() / 10),
+    MaxConcurrent: int64(runtime.NumCPU() * 10),
+    Tracer:        tracer,
+    MinDelay:      100 * time.Millisecond,
+    MaxDelay:      10 * time.Second,
+    Multiplier:    2.0,
+    MaxRetries:    5,
 }
 eventBus := ebConfig.NewFromConfig()
 
 shutdownChan := make(chan struct{}, 1)
 go func() {
-    exitSignal := make(chan os.Signal)
+    exitSignal := make(chan os.Signal, 1)
     signal.Notify(exitSignal, syscall.SIGINT, syscall.SIGTERM)
     <-exitSignal
     if err := eventBus.Close(); err != nil {
@@ -131,11 +187,23 @@ if err := <-eventBus.Listen(); err != nil {
 ### From Constructor
 
 ```Go
-eventBus := eventbus.NewStreamsEventBus("ConsumerFizz", "FizzGroup", conn, 100, 3*time.Second, int64(runtime.NumCPU()/10))
+eventBus := eventbus.NewStreamsEventBus(
+    "ConsumerFizz",
+    "FizzGroup",
+    conn,
+    100,
+    3*time.Second,
+    int64(runtime.NumCPU() * 10),
+    tracer,
+    100*time.Millisecond,
+    10*time.Second,
+    2.0,
+    5,
+)
 
 shutdownChan := make(chan struct{}, 1)
 go func() {
-    exitSignal := make(chan os.Signal)
+    exitSignal := make(chan os.Signal, 1)
     signal.Notify(exitSignal, syscall.SIGINT, syscall.SIGTERM)
     <-exitSignal
     if err := eventBus.Close(); err != nil {
@@ -159,7 +227,16 @@ if err := <-eventBus.Listen(); err != nil {
 
 ## Recommendations
 
-- For handler functions , keep them aware of timeout context passed in each handler.
+- Keep handlers aware of the timeout context passed to them and stop work when
+  `ctx.Done()` is closed.
+- Register all stream handlers before calling `Listen`.
+- For I/O-bound handlers, a starting point such as
+  `int64(runtime.NumCPU() * 10)` can keep CPU cores busy while handlers wait
+  on external services. Use a lower value for CPU-bound handlers and tune it
+  based on workload and downstream capacity.
+- Use `MaxRetries` together with `MinDelay`, `MaxDelay`, and `Multiplier` to
+  control recovery from temporary Redis failures. Successful reads reset the
+  backoff.
 
 ## Future Additions/Improvments
 
