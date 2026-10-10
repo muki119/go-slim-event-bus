@@ -1,0 +1,37 @@
+name: Run Codebase Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call: # lets release.yml gate a release on this same test suite
+
+jobs:
+  go:
+    name: Run Go Tests
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run tests
+        env:
+          TEST_REDIS_HOST: localhost
+          TEST_REDIS_PORT: 6379
+          TEST_REDIS_PASSWORD: ""
+          TEST_REDIS_DB: 0
+        working-directory: ./
+        run: go test -v ./...
